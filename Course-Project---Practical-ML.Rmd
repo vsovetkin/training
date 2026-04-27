@@ -1,0 +1,398 @@
+---
+title: 'Course Project: Practical ML'
+author: "Vadim Sovetkin"
+date: "2026-04-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.path = "figs/"
+)
+```
+
+```{r libraries, echo=FALSE}
+library(tidyverse)
+library(caret)
+library(doParallel)
+```
+
+## 1. Load Data
+
+The training data were pre-downloaded from here: https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv: 
+
+- The number of features in the original training data set is 159, plus the target variable. 
+
+The testing data were pre-downloaded from here: https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv: 
+
+- The number of features in the original testing data set is 159, plus the problem ID variable. 
+
+```{r read_data, echo=TRUE}
+
+# Read data from CSV file 
+training <- read.csv("pml-training.csv", stringsAsFactors = FALSE)
+testing <- read.csv("pml-testing.csv", stringsAsFactors = FALSE)
+
+# Dimensions 
+cat("Training set dimensions:", dim(training))
+cat("\nTesting set dimensions: ", dim(testing))
+
+```
+The goal of the project is to predict the **classe** variable in the target and use any of the other variables as predictors: 
+
+- The variable **class** was converted from character type to a factor with 5 levels. 
+
+The distribution of the **classe** target variable was analysed
+
+- The frequency for for class A at around 28% is higher than for other classes; 
+- The frequency the classes B-E is fairly uniform in the range 16-19%. 
+
+```{r examine_target, echo=TRUE}
+
+# Convert char to factor 
+training$classe <- factor(training$classe)
+
+# Show a frequency table 
+cat("Proportions of the target classes:\n")
+round( prop.table(table(training$classe, useNA="ifany")), 3)
+
+```
+
+## 2. Examine Data Features 
+
+Data exploration and pre-processing was focused on: 
+
+- Identifying and removing empty or uninformative predictors; 
+- Assessing co-linearity (correlation) between predictors; 
+- Decorrelating and reducing the number of features using PCA. 
+
+
+### 2.1. Remove empty features 
+
+A total of 100 features were found to have less that 10% non-empty values: 
+
+- These mostly-empty features were removed from both training and test data sets. 
+
+```{r remove_NA, echo=TRUE}
+
+# Replace #DIV/0! with NA
+training[ training == "#DIV/0!" ] <- NA
+training[ training == "" ] <- NA
+
+# Identify mostly empty columns 
+min_count <- dim(training)[2] * 0.90
+counts_NA <- training %>% summarise( across(everything(), ~ sum(is.na(.))) )
+cat("Number of mostly empty features (NAs > 90%): ", sum(counts_NA > min_count))
+
+# Remove mostly empty columns 
+features_select <- names( counts_NA[ which(counts_NA < min_count) ] )
+training <- training[, features_select ]
+
+cat("\nTraining set dimensions (after NAs removal): ", dim(training))
+
+```
+
+### 2.2. Remove low cardinality and non-informative features 
+
+Some features has low cardinality (number of unique values): 
+
+- The columns **new_window**, **user_name**, **cvtd_timestamp** were found not relevant for predicting the target. 
+- Additional 7 non-informative features were removed from both training and test data sets. 
+
+```{r remove_card, echo=TRUE}
+
+# Identify low cardinality columns 
+cardinality <- data.frame( as.table(sapply(training, function(x) length(unique(x)))) )
+cardinality <- cardinality[ order(cardinality$Freq), ]
+
+cat("Low cardinality features table:\n\n")
+print( head(cardinality) )
+
+# Remove other uninformative columns
+training <- subset( training, select = -c( X, new_window, user_name, cvtd_timestamp, num_window, 
+                                           raw_timestamp_part_1, raw_timestamp_part_2 ) )
+
+# Filer out columns from testing data set 
+problem_id = data.frame(problem_id = testing$problem_id )
+testing <- subset( testing, select = names(subset(training, select=-c(classe))) )
+
+cat("\n\nTraining set dimensions (after low cardinality removal): ", dim(training))
+cat("\nTesting set dimensions (after low cardinality removal):  ", dim(testing))
+
+```
+
+### 2.3. Identify numeric and character features 
+
+All the remaining  predictors were numerical features of either **float** or **integer** type.
+
+```{r feature_types, echo=TRUE}
+
+# Create lists of features 
+features_num <- names(training)[ sapply(training, is.numeric) ]
+features_int <- names(training)[ sapply(training, is.integer) ]
+features_chr <- names(training)[ sapply(training, is.character) ]
+
+n1 <- length(features_num)
+n2 <- length(features_int)
+n3 <- length(features_chr)
+
+# Show the number of features 
+cat("Number of numeric features:   ", n1 )
+cat("\nNumber of integer features:   ", n2 )
+cat("\nNumber of character features: ", n3 )
+
+```
+
+### 2.4. Correlation between numeric features 
+
+Data exploration revealed that many features which are highly correlated with other variables: 
+
+- A total of 22 features have correlation coefficient of 0.80 or higher. 
+
+```{r feature_correlation, echo=TRUE}
+
+# Correlation matrix 
+corr_num <- cor( training[, features_num], use = "pairwise.complete.obs" )
+for(i in 1:n1) { corr_num[i:n1, i] <- 0 }
+
+# Convert to data frame 
+corr_num <- data.frame( as.table(corr_num) ) 
+corr_num <- subset( corr_num, Var1 != Var2 )
+corr_num <- corr_num[ order(abs(corr_num$Freq), decreasing=TRUE), ]
+
+cat("\nCorrelation matrix:\n\n")
+print(head(corr_num, 10))
+
+cat("\nNumber of feature pairs with correlation r > 0.8:\n", sum(corr_num$Freq > 0.8))
+
+```
+
+### 2.5. Transform Features using PCA 
+
+To normalize and de-correlate the predictors, PCA transform has been used: 
+
+- It was found that 27 PCA components explain the cumulative 95% of total variance. 
+- The dimension of the training and testing data can be reduced after PCA transform. 
+- The total number of features for machine learning might be reduced from 52 to 25. 
+
+```{r test_PCA, echo=TRUE}
+
+# Perform a PCA transform 
+transform_pca <- prcomp( subset(training, select = -c(classe)), scale = TRUE )
+
+pca_explained <- transform_pca$sdev^2 / sum(transform_pca$sdev^2)
+pca_explained <- cumsum(pca_explained)
+
+title <- paste("\nNumber of components that explain 95% variance:", which( pca_explained > 0.95 )[1])
+
+plot(pca_explained, ylim=c(0,1), xlab = "Number of PCA Components", ylab = "Explained Variance",  main = title )
+abline( h=0.95, col="red" )
+abline( v=27, col="red" )
+grid()
+
+```
+
+```{r transform_PCA, echo=TRUE}
+
+# Create a PCA transformer
+model_pca <- preProcess( training, method = "pca", thresh = 0.95, scale = TRUE )
+
+# Transform training data 
+train_pca <- predict( model_pca, subset(training, select=-c(classe)) )
+train_pca <- cbind( train_pca, classe = training$classe )
+
+# Transform testing data 
+test_pca <- predict( model_pca, testing )
+
+# Glimpse data
+head(train_pca)
+
+```
+
+## 3. Build Classification Model 
+
+Several different classification model were fit to the training data: 
+
+- Learner 1 - K-Nearest Neighbors model; 
+- Learner 2 - Random Forest model; 
+- Learner 3 - Gradient Boost model; 
+
+A 5-fold cross-validation approach was used to evaluate each model's performance. 
+
+```{r enable_parallel, echo=FALSE}
+
+# Enable parallel 
+registerDoParallel(cores = 10)
+
+```
+
+### 3.1. Create and fit a KNN learner 
+
+Main observations: 
+
+- The number of neighbors $k$ hyperparameter was tuned using cross-valiation. 
+- The classification accuracy increases sharply for $k$ values smaller than 7. 
+- However, the minimum value for $k=5$ was taken to avoid overfitting on the training set. 
+- Overall model accuracy on the training set is around 99%. 
+
+```{r model_knn, echo=TRUE}
+
+# Create and fit KNN model 
+set.seed(123)
+model_knn <- train(
+  classe ~ .,
+  data = training,
+  preProcess = c("center","scale"),
+  method = "knn",
+  trControl = trainControl(method = "cv", number = 5, allowParallel = TRUE),
+  tuneGrid = expand.grid(k = seq(5, 15, by = 2))
+)
+
+cat("Description of KNN model:\n\n")
+print(model_knn)
+
+cat("\n\nConfusion matrix for KNN model (training set):\n")
+pred_train_knn <- predict( model_knn, training )
+table( pred_train_knn, training$classe )
+
+cat("\n\nAccuracy for KNN model (training set):\n")
+round( mean(pred_train_knn == training$classe) , 4)
+
+```
+
+### 3.2.Create and fit a Random Forest learner
+
+Main observations: 
+
+- Hyperparameter **mtry** was optimized via cross-validation; 
+- Overall model accuracy on the training set is around 98%. 
+
+```{r model_rf, echo=TRUE}
+
+# Create and fit RF model 
+set.seed(123)
+model_rf <- train(
+  classe ~ .,
+  data = training,
+  method = "rf",
+  trControl = trainControl(method = "cv", number = 5, allowParallel = TRUE),
+  tuneGrid = expand.grid(mtry = 1:5),
+  verbose = FALSE 
+)
+
+cat("Description of RF model:\n\n")
+print(model_rf)
+
+cat("\nConfusion matrix for RF model (training set):\n")
+pred_train_rf <- predict( model_rf, training )
+table( pred_train_rf, training$classe )
+
+cat("\n\nAccuracy for RF model (training set):\n")
+round( mean(pred_train_rf == training$classe) , 4)
+
+```
+
+### 3.3. Create and fit a Gradient Boost learner 
+
+Main observations: 
+
+- Hyperparameters **n.trees**, **interaction.depth**, and **shrinkage** were optimized via cross-validation; 
+- Overall model accuracy on the training set is around 96%. 
+
+```{r model_gbm, echo=TRUE}
+
+# Hyperparameter grid 
+grid_gbm <- expand.grid(
+  n.trees = seq(100, 200, by = 50),
+  interaction.depth = c(3, 5, 7),
+  shrinkage = c(0.05, 0.1),
+  n.minobsinnode = 10
+)
+
+# Create and fit GBM model 
+set.seed(123)
+model_gbm <- train(
+  classe ~ ., 
+  data = training, 
+  method = "gbm", 
+  trControl = trainControl(method = "cv", number = 5, allowParallel = TRUE),
+  tuneGrid = grid_gbm,
+  verbose = FALSE 
+)
+
+cat("Description of GBM model:\n\n")
+print(model_gbm)
+
+cat("\nConfusion matrix for GBM model (training set):\n")
+pred_train_gbm <- predict( model_gbm, training )
+table( pred_train_gbm, training$classe )
+
+cat("\n\nAccuracy for GBM model (training set):\n")
+round( mean(pred_train_gbm == training$classe) , 4)
+
+```
+
+### 3.4. Predict labels for the test set with a meta-model 
+
+A meta-model was created using three individual learners: 
+
+- The stacked model was trained using predicted values from three learners. 
+- A C5.0 (rules based) model with default setting was used. 
+- A small improvement in the accuracy on the training set was achieved. 
+
+```{r train_meta, echo=TRUE}
+
+# Combined individual learners' predictions and the target 
+train_combined <- data.frame( p1 = pred_train_knn, p2 = pred_train_rf, p3 = pred_train_gbm, classe = training$classe )
+
+# Create and fit a stacked meta-model 
+model_meta <- train(
+  classe ~ ., 
+  method = "C5.0",
+  trControl = trainControl(method = "cv", number = 5, allowParallel = TRUE),
+  tuneGrid = expand.grid(model = "rules", trials = 10, winnow = TRUE),
+  data = train_combined, 
+  verbose = FALSE 
+)
+
+cat("Description of meta model:\n\n")
+print(model_meta)
+
+cat("Confusion matrix for meta model (training set):\n")
+pred_train_meta <- predict( model_meta, train_combined )
+table( pred_train_meta, training$classe )
+
+cat("\n\nAccuracy for meta model (training set):\n")
+round( mean(pred_train_meta == training$classe) , 4)
+
+```
+
+The meta-model was use to predict **classe** labels: 
+
+- The stacked model predicted classes for the test set based on predictions from the three learners. 
+
+```{r test_meta, echo=TRUE}
+
+# Combined individual learners' predictions and the target 
+test_combined <- data.frame(
+  p1 = predict(model_knn, testing),
+  p2 = predict(model_rf, testing),
+  p3 = predict(model_gbm, testing)
+)
+
+cat("Predictions for the test set:\n\n")
+test_predicted <- cbind( test_combined, problem_id = problem_id, predicted = predict( model_meta, test_combined ) )
+print( test_predicted )
+
+```
+
+```{r disable_parallel, echo=FALSE}
+
+# Close the parallel cluster 
+stopImplicitCluster()
+
+```
+
